@@ -83,6 +83,8 @@
 EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
           *out_dir,                   /* Working & output directory       */
+          *information_file_name,     /* Information file name            */
+          *time_file_name,            /* Time file name                   */
           *sync_dir,                  /* Synchronization directory        */
           *sync_id,                   /* Fuzzer ID                        */
           *use_banner,                /* Display banner                   */
@@ -108,6 +110,7 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            timeout_given,             /* Specific timeout given?          */
            not_on_tty,                /* stdout is not a tty              */
            term_too_small,            /* terminal dimensions too small    */
+           state_of_fuzz = 0,         /* State of fuzzing                 */
            uses_asan,                 /* Target uses ASAN?                */
            no_forkserver,             /* Disable forkserver?              */
            crash_mode,                /* Crash mode! Yeah!                */
@@ -127,6 +130,8 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
            dev_null_fd = -1,          /* Persistent fd for /dev/null      */
+           information_fd,            /* Persistent fd for out-file       */
+           time_fd,                   /* Persistent fd for time file      */
            fsrv_ctl_fd,               /* Fork server control pipe (write) */
            fsrv_st_fd;                /* Fork server status pipe (read)   */
 
@@ -147,10 +152,13 @@ static s32 shm_id;                    /* ID of the SHM region             */
 static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
                    clear_screen = 1,  /* Window resized?                  */
                    child_timed_out;   /* Traced process timed out?        */
+static float rate = 1;                /* Rate of regret                   */
+
 
 EXP_ST u32 queued_paths,              /* Total number of queued testcases */
            queued_variable,           /* Testcases with variable behavior */
            queued_at_start,           /* Total number of initial inputs   */
+           queued_paths_initial,      /* Initial paths                    */
            queued_discovered,         /* Items discovered during this run */
            queued_imported,           /* Items imported via -S            */
            queued_favored,            /* Paths deemed favorable           */
@@ -160,6 +168,7 @@ EXP_ST u32 queued_paths,              /* Total number of queued testcases */
            cur_skipped_paths,         /* Abandoned inputs in cur cycle    */
            cur_depth,                 /* Current path depth               */
            max_depth,                 /* Max path depth                   */
+           calculate_coe = 0,         /* Coefficient of calculate rate    */
            useless_at_start,          /* Number of useless starting paths */
            var_byte_count,            /* Bitmap bytes with var behavior   */
            current_entry,             /* Current queue entry ID           */
@@ -171,6 +180,7 @@ EXP_ST u64 total_crashes,             /* Total number of crashes          */
            unique_tmouts,             /* Timeouts with unique signatures  */
            unique_hangs,              /* Hangs with unique signatures     */
            total_execs,               /* Total execve() calls             */
+           total_fuzz = 0,            /* Total fuzzs                      */
            start_time,                /* Unix start time (ms)             */
            last_path_time,            /* Time for most recent path (ms)   */
            last_crash_time,           /* Time for most recent crash (ms)  */
@@ -221,7 +231,9 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 
 #endif /* HAVE_AFFINITY */
 
-static FILE* plot_file;               /* Gnuplot output file              */
+static FILE *plot_file,               /* Gnuplot output file              */
+            *time_file,               /* Time output file                 */
+            *information_file;        /* Information output file          */
 
 struct queue_entry {
 
@@ -234,14 +246,26 @@ struct queue_entry {
       passed_det,                     /* Deterministic stages passed?     */
       has_new_cov,                    /* Triggers new coverage?           */
       var_behavior,                   /* Variable behavior?               */
+      state,                          /* Was fuzzed dutring state 2?      */
       favored,                        /* Currently favored?               */
+      last_found,                     /* Number of found paths            */
+      abandon,                        /* Marked as abandon?               */
+      TS_max,                         /* Chose for t/s is maxed?          */
       fs_redundant;                   /* Marked as redundant in the fs?   */
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
+      chose_time,                     /* Number of times chose for fuzz   */
+      serial,                         /* Serial number of this test case  */
       exec_cksum;                     /* Checksum of the execution trace  */
 
   u64 exec_us,                        /* Execution time (us)              */
       handicap,                       /* Number of queue cycles behind    */
+      line,                           /* Number of paths to find path     */
+      exec_num,                       /* Number of execution of this path */
+      last_energy,                    /* Number of test cases last fuzzing*/
+      mutation_num,                   /* Number of mutating the test case */
+      exec_by_mutation,               /* Number of mutated by this test   */
+      power,                          /* Power of mutation number         */
       depth;                          /* Path depth                       */
 
   u8* trace_mini;                     /* Trace bytes, if kept             */
@@ -348,7 +372,28 @@ static u64 get_cur_time_us(void) {
   return (tv.tv_sec * 1000000ULL) + tv.tv_usec;
 
 }
+static u32 get_sqrt(u32 val){
+  u32 i = 0;
+  u64 r = 0;
+  for(; r <= val; i++){
+    r = i * i;
+  }
 
+  return i-1;
+}
+
+
+/* Get a number of power of two. */
+static u64 get_power_of_two(u32 val){
+  u32 i = 0;
+  u64 ret = 1;
+
+  for(; i < val; i++){
+    ret = ret * 2;
+  }
+
+  return ret;
+}
 
 /* Generate a random number (from 0 to limit - 1). This may
    have slight bias. */
@@ -369,7 +414,6 @@ static inline u32 UR(u32 limit) {
   return random() % limit;
 
 }
-
 
 /* Shuffle an array of pointers. Might be slightly biased. */
 
@@ -595,7 +639,7 @@ static u8* DI(u64 val) {
 }
 
 
-/* Describe float. Similar to the above, except with a single 
+/* Describe float. Similar to the above, except with a single
    static buffer. */
 
 static u8* DF(double val) {
@@ -769,7 +813,64 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
   ck_free(fn);
 
 }
+/* Setup the time file fds.*/
+EXP_ST void setup_time_fds(void) {
 
+  ACTF("Setup time file...");
+
+  time_file_name = alloc_printf("%s/information_of_time", out_dir);
+  time_fd = open(time_file_name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (time_fd < 0) PFATAL("Unable to create '%s'.", time_file_name);
+
+  time_file = fdopen(time_fd, "a");
+  if (!time_file) PFATAL("Fdopen time file failed.");
+                     /* ignore errors */
+}
+
+/* Setup the information file fds.*/
+EXP_ST void setup_information_fds(void) {
+
+  ACTF("Setup information file...");
+
+  information_file_name = alloc_printf("%s/information_of_havoc", out_dir);
+  information_fd = open(information_file_name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (information_fd < 0) PFATAL("Unable to create '%s'.", information_file_name);
+
+  information_file = fdopen(information_fd, "a");
+  if (!information_file) PFATAL("Fdopen information file failed.");
+                     /* ignore errors */
+}
+
+/* Write information to time file*/
+static void write_to_time_file(u64 record_time) {
+    fprintf(time_file, "State:%d Time:%llu\n", state_of_fuzz, record_time);
+
+}
+
+/* Write information to output file*/
+static void write_to_information_file(u8* items_name) {
+
+  if(!strcmp(items_name,"start")){
+
+    fprintf(information_file, "Cksum:%u Stage_max:%d ", queue_cur->exec_cksum, stage_max);
+
+  }
+  else if(!strcmp(items_name,"end")){
+
+    fprintf(information_file, "Final_stage_max:%d State:%d\n", stage_max, state_of_fuzz);
+
+  }
+  else{
+
+    u32 temp_cksum;
+
+    temp_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+    fprintf(information_file, "Find:%d,%u ", stage_cur, temp_cksum);
+
+  }
+
+}
 
 /* Append new test case to the queue. */
 
@@ -781,6 +882,16 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
+  q->mutation_num = 0;
+  q->exec_num = 1;
+  q->exec_by_mutation = 0;
+  q->last_found = 0;
+  q->chose_time = 0;
+  q->abandon = 0;
+  q->line = queued_paths;
+  q->last_energy = 0;
+  q->state = 0;
+  q->serial = queued_paths;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -801,6 +912,10 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
     q_prev100->next_100 = q;
     q_prev100 = q;
 
+  }
+
+  if(!strncmp(stage_name, "havoc", 5) || !strncmp(stage_name, "splice", 6)){
+    write_to_information_file("find");
   }
 
   last_path_time = get_cur_time();
@@ -869,7 +984,7 @@ EXP_ST void read_bitmap(u8* fname) {
 
 /* Check if the current execution path brings anything new to the table.
    Update virgin bits to reflect the finds. Returns 1 if the only change is
-   the hit-count for a particular tuple; 2 if there are new tuples seen. 
+   the hit-count for a particular tuple; 2 if there are new tuples seen.
    Updates the map, so subsequent calls will always return 0.
 
    This function is called after every exec() on a fairly large buffer, so
@@ -1040,7 +1155,7 @@ static u32 count_non_255_bytes(u8* mem) {
    is hit or not. Called on every new crash or timeout, should be
    reasonably fast. */
 
-static const u8 simplify_lookup[256] = { 
+static const u8 simplify_lookup[256] = {
 
   [0]         = 1,
   [1 ... 255] = 128
@@ -1132,9 +1247,9 @@ EXP_ST void init_count_class16(void) {
 
   u32 b1, b2;
 
-  for (b1 = 0; b1 < 256; b1++) 
+  for (b1 = 0; b1 < 256; b1++)
     for (b2 = 0; b2 < 256; b2++)
-      count_class_lookup16[(b1 << 8) + b2] = 
+      count_class_lookup16[(b1 << 8) + b2] =
         (count_class_lookup8[b1] << 8) |
         count_class_lookup8[b2];
 
@@ -1277,6 +1392,72 @@ static void update_bitmap_score(struct queue_entry* q) {
 
 }
 
+static void schedule(void) {
+  struct queue_entry *q, *p;
+  u32 i = 0;
+
+  q = queue;
+  p = queue;
+  while(q){
+    if(!q->was_fuzzed && queue_cur->was_fuzzed){
+      queue_cur = q;
+      current_entry = i;
+      break;
+    }
+    q = q->next;
+    i++;
+  }
+  q = queue;
+  while(q) {
+    if(!q->was_fuzzed){
+     state_of_fuzz = 1;
+     return;
+    }
+    q = q->next;
+  }
+  state_of_fuzz = 2;
+  q = queue;
+  p = queue;
+  i = 0;
+  while(p){
+    if(p->state != 2)
+      break;
+    i++;
+    p = p->next;
+  }
+  if(!p){
+    p = queue;
+    while(p){
+      p->state = 0;
+      p = p->next;
+    }
+    p = queue;
+    i = 0;
+  }
+  while(q){
+    if(q->exec_by_mutation * p->mutation_num * get_sqrt(p->serial) < p->exec_by_mutation * q->mutation_num * get_sqrt(q->serial) && q->state == 0){
+      p = q;
+      current_entry = i;
+    }
+    q = q->next;
+    i++;
+  }
+  queue_cur = p;
+
+}
+
+static u32 judge_seeds(void) {
+  struct queue_entry *q;
+  q = queue;
+
+  while(q){
+    if(queue_cur->mutation_num * q->exec_num < q->mutation_num * queue_cur->exec_num && queue_cur != q)
+      return 1;
+    q = q->next;
+  }
+
+  return 0;
+}
 
 /* The second part of the mechanism discussed above is a routine that
    goes over top_rated[] entries, and then sequentially grabs winners for
@@ -1316,7 +1497,7 @@ static void cull_queue(void) {
 
       /* Remove all bits belonging to the current entry from temp_v. */
 
-      while (j--) 
+      while (j--)
         if (top_rated[i]->trace_mini[j])
           temp_v[j] &= ~top_rated[i]->trace_mini[j];
 
@@ -1335,7 +1516,6 @@ static void cull_queue(void) {
   }
 
 }
-
 
 /* Configure shared memory and virgin_bits. This is called at startup. */
 
@@ -1366,7 +1546,7 @@ EXP_ST void setup_shm(void) {
   ck_free(shm_str);
 
   trace_bits = shmat(shm_id, NULL, 0);
-  
+
   if (!trace_bits) PFATAL("shmat() failed");
 
 }
@@ -1453,7 +1633,7 @@ static void read_testcases(void) {
     u8  passed_det = 0;
 
     free(nl[i]); /* not tracked */
- 
+
     if (lstat(fn, &st) || access(fn, R_OK))
       PFATAL("Unable to access '%s'", fn);
 
@@ -1467,7 +1647,7 @@ static void read_testcases(void) {
 
     }
 
-    if (st.st_size > MAX_FILE) 
+    if (st.st_size > MAX_FILE)
       FATAL("Test case '%s' is too big (%s, limit is %s)", fn,
             DMS(st.st_size), DMS(MAX_FILE));
 
@@ -1792,7 +1972,7 @@ static void maybe_add_auto(u8* mem, u32 len) {
 
     i = sizeof(interesting_16) >> 1;
 
-    while (i--) 
+    while (i--)
       if (*((u16*)mem) == interesting_16[i] ||
           *((u16*)mem) == SWAP16(interesting_16[i])) return;
 
@@ -1802,7 +1982,7 @@ static void maybe_add_auto(u8* mem, u32 len) {
 
     i = sizeof(interesting_32) >> 2;
 
-    while (i--) 
+    while (i--)
       if (*((u32*)mem) == interesting_32[i] ||
           *((u32*)mem) == SWAP32(interesting_32[i])) return;
 
@@ -1952,12 +2132,12 @@ static void destroy_extras(void) {
 
   u32 i;
 
-  for (i = 0; i < extras_cnt; i++) 
+  for (i = 0; i < extras_cnt; i++)
     ck_free(extras[i].data);
 
   ck_free(extras);
 
-  for (i = 0; i < a_extras_cnt; i++) 
+  for (i = 0; i < a_extras_cnt; i++)
     ck_free(a_extras[i].data);
 
   ck_free(a_extras);
@@ -2277,7 +2457,7 @@ static u8 run_target(char** argv, u32 timeout) {
 
   /* If we're running in "dumb" mode, we can't rely on the fork server
      logic compiled into the target program, so we will just keep calling
-     execve(). There is a bit of code duplication between here and 
+     execve(). There is a bit of code duplication between here and
      init_forkserver(), but c'est la vie. */
 
   if (dumb_mode == 1 || no_forkserver) {
@@ -2726,7 +2906,7 @@ static void perform_dry_run(char** argv) {
     if (stop_soon) return;
 
     if (res == crash_mode || res == FAULT_NOBITS)
-      SAYF(cGRA "    len = %u, map size = %u, exec speed = %llu us\n" cRST, 
+      SAYF(cGRA "    len = %u, map size = %u, exec speed = %llu us\n" cRST,
            q->len, q->bitmap_size, q->exec_us);
 
     switch (res) {
@@ -2778,7 +2958,7 @@ static void perform_dry_run(char** argv) {
 
         }
 
-      case FAULT_CRASH:  
+      case FAULT_CRASH:
 
         if (crash_mode) break;
 
@@ -2815,7 +2995,7 @@ static void perform_dry_run(char** argv) {
                "      if you are using ASAN, see %s/notes_for_asan.txt.\n\n"
 
 #ifdef __APPLE__
-  
+
                "    - On MacOS X, the semantics of fork() syscalls are non-standard and may\n"
                "      break afl-fuzz performance optimizations when running platform-specific\n"
                "      binaries. To fix this, set AFL_NO_FORKSRV=1 in the environment.\n\n"
@@ -2837,7 +3017,7 @@ static void perform_dry_run(char** argv) {
                "      inputs - but not ones that cause an outright crash.\n\n"
 
 #ifdef __APPLE__
-  
+
                "    - On MacOS X, the semantics of fork() syscalls are non-standard and may\n"
                "      break afl-fuzz performance optimizations when running platform-specific\n"
                "      binaries. To fix this, set AFL_NO_FORKSRV=1 in the environment.\n\n"
@@ -2859,7 +3039,7 @@ static void perform_dry_run(char** argv) {
 
         FATAL("No instrumentation detected");
 
-      case FAULT_NOBITS: 
+      case FAULT_NOBITS:
 
         useless_at_start++;
 
@@ -2914,7 +3094,7 @@ static void link_or_copy(u8* old_path, u8* new_path) {
 
   tmp = ck_alloc(64 * 1024);
 
-  while ((i = read(sfd, tmp, 64 * 1024)) > 0) 
+  while ((i = read(sfd, tmp, 64 * 1024)) > 0)
     ck_write(dfd, tmp, i, new_path);
 
   if (i < 0) PFATAL("read() failed");
@@ -3046,7 +3226,7 @@ static u8* describe_op(u8 hnb) {
       sprintf(ret + strlen(ret), ",pos:%u", stage_cur_byte);
 
       if (stage_val_type != STAGE_VAL_NONE)
-        sprintf(ret + strlen(ret), ",val:%s%+d", 
+        sprintf(ret + strlen(ret), ",val:%s%+d",
                 (stage_val_type == STAGE_VAL_BE) ? "be:" : "",
                 stage_cur_val);
 
@@ -3121,6 +3301,18 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
   s32 fd;
   u8  keeping = 0, res;
 
+  u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+  struct queue_entry* q = queue;
+  while (q) {
+    if (q->exec_cksum == cksum)
+      q->exec_num = q->exec_num + 1;
+
+    q = q->next;
+  }
+  if(cksum == queue_cur->exec_cksum)
+    queue_cur->exec_by_mutation++;
+
   if (fault == crash_mode) {
 
     /* Keep only if there are new bits in the map, add to queue for
@@ -3129,7 +3321,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     if (!(hnb = has_new_bits(virgin_bits))) {
       if (crash_mode) total_crashes++;
       return 0;
-    }    
+    }
 
 #ifndef SIMPLE_FILES
 
@@ -3149,10 +3341,10 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       queued_with_cov++;
     }
 
-    queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+    queue_top->exec_cksum = cksum;
 
-    /* Try to calibrate inline; this also calls update_bitmap_score() when
-       successful. */
+        /* Try to calibrate inline; this also calls update_bitmap_score() when
+           successful. */
 
     res = calibrate_case(argv, queue_top, mem, queue_cycle - 1, 0);
 
@@ -3459,7 +3651,7 @@ static void maybe_update_plot_file(double bitmap_cvg, double eps) {
   static u32 prev_qp, prev_pf, prev_pnf, prev_ce, prev_md;
   static u64 prev_qc, prev_uc, prev_uh;
 
-  if (prev_qp == queued_paths && prev_pf == pending_favored && 
+  if (prev_qp == queued_paths && prev_pf == pending_favored &&
       prev_pnf == pending_not_fuzzed && prev_ce == current_entry &&
       prev_qc == queue_cycle && prev_uc == unique_crashes &&
       prev_uh == unique_hangs && prev_md == max_depth) return;
@@ -3479,11 +3671,11 @@ static void maybe_update_plot_file(double bitmap_cvg, double eps) {
      favored_not_fuzzed, unique_crashes, unique_hangs, max_depth,
      execs_per_sec */
 
-  fprintf(plot_file, 
-          "%llu, %llu, %u, %u, %u, %u, %0.02f%%, %llu, %llu, %u, %0.02f\n",
+  fprintf(plot_file,
+          "%llu, %llu, %u, %u, %u, %u, %0.02f%%, %llu, %llu, %u, %0.02f, %llu, %u\n",
           get_cur_time() / 1000, queue_cycle - 1, current_entry, queued_paths,
           pending_not_fuzzed, pending_favored, bitmap_cvg, unique_crashes,
-          unique_hangs, max_depth, eps); /* ignore errors */
+          unique_hangs, max_depth, eps, total_execs, state_of_fuzz); /* ignore errors */
 
   fflush(plot_file);
 
@@ -3555,7 +3747,7 @@ static double get_runnable_processes(void) {
         !strncmp(tmp, "procs_blocked ", 14)) val += atoi(tmp + 14);
 
   }
- 
+
   fclose(f);
 
   if (!res) {
@@ -3839,6 +4031,14 @@ static void maybe_delete_out_dir(void) {
   if (unlink(fn) && errno != ENOENT) goto dir_cleanup_failed;
   ck_free(fn);
 
+  fn = alloc_printf("%s/information_of_havoc", out_dir);
+  if (unlink(fn) && errno != ENOENT) goto dir_cleanup_failed;
+  ck_free(fn);
+
+  fn = alloc_printf("%s/information_of_time", out_dir);
+  if (unlink(fn) && errno != ENOENT) goto dir_cleanup_failed;
+  ck_free(fn);
+
   OKF("Output dir cleanup successful.");
 
   /* Wow... is that all? If yes, celebrate! */
@@ -3892,7 +4092,7 @@ static void show_stats(void) {
   /* Calculate smoothed exec speed stats. */
 
   if (!last_execs) {
-  
+
     avg_exec = ((double)total_execs) * 1000 / (cur_ms - start_time);
 
   } else {
@@ -3924,7 +4124,7 @@ static void show_stats(void) {
   t_bytes = count_non_255_bytes(virgin_bits);
   t_byte_ratio = ((double)t_bytes * 100) / MAP_SIZE;
 
-  if (t_bytes) 
+  if (t_bytes)
     stab_ratio = 100 - ((double)var_byte_count) * 100 / t_bytes;
   else
     stab_ratio = 100;
@@ -3946,7 +4146,7 @@ static void show_stats(void) {
 
     last_plot_ms = cur_ms;
     maybe_update_plot_file(t_byte_ratio, avg_exec);
- 
+
   }
 
   /* Honor AFL_EXIT_WHEN_DONE and AFL_BENCH_UNTIL_CRASH. */
@@ -3993,7 +4193,7 @@ static void show_stats(void) {
   memset(tmp, ' ', banner_pad);
 
   sprintf(tmp + banner_pad, "%s " cLCY VERSION cLGN
-          " (%s)",  crash_mode ? cPIN "peruvian were-rabbit" : 
+          " (%s)",  crash_mode ? cPIN "peruvian were-rabbit" :
           cYEL "american fuzzy lop", use_banner);
 
   SAYF("\n%s\n\n", tmp);
@@ -4055,7 +4255,7 @@ static void show_stats(void) {
 
     if (dumb_mode)
 
-      SAYF(bV bSTOP "   last new path : " cPIN "n/a" cRST 
+      SAYF(bV bSTOP "   last new path : " cPIN "n/a" cRST
            " (non-instrumented mode)        ");
 
      else
@@ -4082,7 +4282,7 @@ static void show_stats(void) {
   sprintf(tmp, "%s%s", DI(unique_hangs),
          (unique_hangs >= KEEP_UNIQUE_HANG) ? "+" : "");
 
-  SAYF(bV bSTOP "  last uniq hang : " cRST "%-34s " bSTG bV bSTOP 
+  SAYF(bV bSTOP "  last uniq hang : " cRST "%-34s " bSTG bV bSTOP
        "   uniq hangs : " cRST "%-6s " bSTG bV "\n",
        DTD(cur_ms, last_hang_time), tmp);
 
@@ -4099,10 +4299,10 @@ static void show_stats(void) {
 
   SAYF(bV bSTOP "  now processing : " cRST "%-17s " bSTG bV bSTOP, tmp);
 
-  sprintf(tmp, "%0.02f%% / %0.02f%%", ((double)queue_cur->bitmap_size) * 
+  sprintf(tmp, "%0.02f%% / %0.02f%%", ((double)queue_cur->bitmap_size) *
           100 / MAP_SIZE, t_byte_ratio);
 
-  SAYF("    map density : %s%-21s " bSTG bV "\n", t_byte_ratio > 70 ? cLRD : 
+  SAYF("    map density : %s%-21s " bSTG bV "\n", t_byte_ratio > 70 ? cLRD :
        ((t_bytes < 200 && !dumb_mode) ? cPIN : cRST), tmp);
 
   sprintf(tmp, "%s (%0.02f%%)", DI(cur_skipped_paths),
@@ -4123,7 +4323,7 @@ static void show_stats(void) {
 
   /* Yeah... it's still going on... halp? */
 
-  SAYF(bV bSTOP "  now trying : " cRST "%-21s " bSTG bV bSTOP 
+  SAYF(bV bSTOP "  now trying : " cRST "%-21s " bSTG bV bSTOP
        " favored paths : " cRST "%-22s " bSTG bV "\n", stage_name, tmp);
 
   if (!stage_max) {
@@ -4249,7 +4449,7 @@ static void show_stats(void) {
   if (t_bytes) sprintf(tmp, "%0.02f%%", stab_ratio);
     else strcpy(tmp, "n/a");
 
-  SAYF(" stability : %s%-10s " bSTG bV "\n", (stab_ratio < 85 && var_byte_count > 40) 
+  SAYF(" stability : %s%-10s " bSTG bV "\n", (stab_ratio < 85 && var_byte_count > 40)
        ? cLRD : ((queued_variable && (!persistent_mode || var_byte_count > 20))
        ? cMGN : cRST), tmp);
 
@@ -4309,7 +4509,7 @@ static void show_stats(void) {
 
     if (cpu_aff >= 0) {
 
-      SAYF(SP10 cGRA "[cpu%03u:%s%3u%%" cGRA "]\r" cRST, 
+      SAYF(SP10 cGRA "[cpu%03u:%s%3u%%" cGRA "]\r" cRST,
            MIN(cpu_aff, 999), cpu_color,
            MIN(cur_utilization, 999));
 
@@ -4317,7 +4517,7 @@ static void show_stats(void) {
 
       SAYF(SP10 cGRA "   [cpu:%s%3u%%" cGRA "]\r" cRST,
            cpu_color, MIN(cur_utilization, 999));
- 
+
    }
 
 #else
@@ -4366,7 +4566,7 @@ static void show_init_stats(void) {
 
   SAYF("\n");
 
-  if (avg_us > (qemu_mode ? 50000 : 10000)) 
+  if (avg_us > (qemu_mode ? 50000 : 10000))
     WARNF(cLRD "The target binary is pretty slow! See %s/perf_tips.txt.",
           doc_path);
 
@@ -4400,7 +4600,7 @@ static void show_init_stats(void) {
       cGRA "    Test case count : " cRST "%u favored, %u variable, %u total\n"
       cGRA "       Bitmap range : " cRST "%u to %u bits (average: %0.02f bits)\n"
       cGRA "        Exec timing : " cRST "%s to %s us (average: %s us)\n",
-      queued_favored, queued_variable, queued_paths, min_bits, max_bits, 
+      queued_favored, queued_variable, queued_paths, min_bits, max_bits,
       ((double)total_bitmap_size) / (total_bitmap_entries ? total_bitmap_entries : 1),
       DI(min_us), DI(max_us), DI(avg_us));
 
@@ -4422,7 +4622,7 @@ static void show_init_stats(void) {
 
     if (exec_tmout > EXEC_TIMEOUT) exec_tmout = EXEC_TIMEOUT;
 
-    ACTF("No -t option specified, so I'll use exec timeout of %u ms.", 
+    ACTF("No -t option specified, so I'll use exec timeout of %u ms.",
          exec_tmout);
 
     timeout_given = 1;
@@ -4453,7 +4653,39 @@ static u32 next_p2(u32 val) {
   while (val > ret) ret <<= 1;
   return ret;
 
-} 
+}
+
+/* Find the power of two smaller to val. */
+static u64 first_p2(u64 val) {
+  u64 ret = 1, i = 0;
+  while (val >= ret){
+    ret <<= 1;
+    i++;
+  }
+  i--;
+  return i;
+}
+
+/* Calculate power of each seeds. */
+static u64 calculate_power(u32 len) {
+  u64 max_power = 0;
+
+  max_power += (len << 3);
+  max_power += ((len << 3)- 1);
+  max_power += ((len << 3)- 3);
+  max_power += (len * 3 - 4);
+  max_power += 2 * len * ARITH_MAX;
+  max_power += 4 * (len - 1) * ARITH_MAX;
+  max_power += 4 * (len - 3) * ARITH_MAX;
+  max_power += len * sizeof(interesting_8);
+  max_power += 2 * (len - 1) * (sizeof(interesting_16) >> 1);
+  max_power += 2 * (len - 3) * (sizeof(interesting_32) >> 2);
+  max_power += 2 * extras_cnt * len;
+  max_power += MIN(a_extras_cnt, USE_AUTO_EXTRAS) * len;
+
+  return max_power;
+}
+
 
 
 /* Trim all new test cases to save cycles when doing deterministic checks. The
@@ -4525,7 +4757,7 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
         q->len -= trim_avail;
         len_p2  = next_p2(q->len);
 
-        memmove(in_buf + remove_pos, in_buf + remove_pos + trim_avail, 
+        memmove(in_buf + remove_pos, in_buf + remove_pos + trim_avail,
                 move_tail);
 
         /* Let's save a clean trace, which will be needed by
@@ -4598,6 +4830,7 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   write_to_testcase(out_buf, len);
 
   fault = run_target(argv, exec_tmout);
+  total_fuzz++;
 
   if (stop_soon) return 1;
 
@@ -4622,6 +4855,8 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   }
 
   /* This handles FAULT_ERROR for us: */
+
+  queue_cur->mutation_num++;
 
   queued_discovered += save_if_interesting(argv, out_buf, len, fault);
 
@@ -4653,7 +4888,7 @@ static u32 choose_block_len(u32 limit) {
              max_value = HAVOC_BLK_MEDIUM;
              break;
 
-    default: 
+    default:
 
              if (UR(10)) {
 
@@ -4859,7 +5094,7 @@ static u8 could_be_arith(u32 old_val, u32 new_val, u8 blen) {
 }
 
 
-/* Last but not least, a similar helper to see if insertion of an 
+/* Last but not least, a similar helper to see if insertion of an
    interesting integer is redundant given the insertions done for
    shorter blen. The last param (check_le) is set if the caller
    already executed LE insertion for current blen and wants to see
@@ -4932,7 +5167,6 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
 }
 
-
 /* Take the current entry from the queue, fuzz it for a while. This
    function is a tad too long... returns 0 if fuzzed successfully, 1 if
    skipped or bailed out. */
@@ -4941,13 +5175,19 @@ static u8 fuzz_one(char** argv) {
 
   s32 len, fd, temp_len, i, j;
   u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
-  u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
-  u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
+  u64 havoc_queued,  orig_hit_cnt, new_hit_cnt, last_mutation_num = 0, energy, energy_in_det = 0, start_record, end_record, record_time;
+  u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1, last_queued_paths = queued_paths, record_num = 0, average_cost = 0;
+  struct queue_entry* q = queue;
 
-  u8  ret_val = 1, doing_det = 0;
+  u8  ret_val = 1, doing_det = 0, ret_of_fuzz, skip_havoc = 0;;
+
+  start_record = get_cur_time_us();
+
+  float regret = 0;
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
+  last_mutation_num = queue_cur->mutation_num;
 
 #ifdef IGNORE_FINDS
 
@@ -4957,33 +5197,6 @@ static u8 fuzz_one(char** argv) {
   if (queue_cur->depth > 1) return 1;
 
 #else
-
-  if (pending_favored) {
-
-    /* If we have any favored, non-fuzzed new arrivals in the queue,
-       possibly skip to them at the expense of already-fuzzed or non-favored
-       cases. */
-
-    if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
-        UR(100) < SKIP_TO_NEW_PROB) return 1;
-
-  } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
-
-    /* Otherwise, still possibly skip non-favored cases, albeit less often.
-       The odds of skipping stuff are higher for already-fuzzed inputs and
-       lower for never-fuzzed entries. */
-
-    if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
-
-      if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
-
-    } else {
-
-      if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
-
-    }
-
-  }
 
 #endif /* ^IGNORE_FINDS */
 
@@ -5067,17 +5280,56 @@ static u8 fuzz_one(char** argv) {
 
   memcpy(out_buf, in_buf, len);
 
+  queue_cur->chose_time++;
+
   /*********************
    * PERFORMANCE SCORE *
    *********************/
 
   orig_perf = perf_score = calculate_score(queue_cur);
+  if(queued_paths == queued_paths_initial)
+    average_cost = total_fuzz / queued_paths;
+  else
+    average_cost = total_fuzz / (queued_paths - queued_paths_initial);
+
+  if(average_cost == 0)
+    average_cost = 1024;
+
+  if(state_of_fuzz == 2){
+    queue_cur->state = 2;
+    if(queue_cur->last_found == 0){
+      energy = MIN(2 * queue_cur->last_energy, 16 * average_cost);
+    }
+    else{
+      energy = MIN(queue_cur->last_energy, 16 * average_cost);
+    }
+    if(energy == 0){
+      if(queue_cur->exec_num > average_cost)
+        energy = average_cost/4;
+      else if(queue_cur->exec_num > average_cost/2)
+        energy = average_cost/2;
+      else
+        energy = average_cost;
+      }
+    energy = energy * rate;
+  }
+  else{
+    if(queue_cur->exec_num > average_cost)
+      energy = average_cost/4;
+    else if(queue_cur->exec_num > average_cost/2)
+      energy = average_cost/2;
+    else
+      energy = average_cost;
+    energy = energy * rate;
+  }
+    
+    goto havoc_stage;
 
   /* Skip right away if -d is given, if we have done deterministic fuzzing on
      this entry ourselves (was_fuzzed), or if it has gone through deterministic
      testing in earlier, resumed runs (passed_det). */
 
-  if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
+  if (skip_deterministic || queue_cur->passed_det)
     goto havoc_stage;
 
   /* Skip deterministic fuzzing if exec path checksum puts this out of scope
@@ -5086,8 +5338,10 @@ static u8 fuzz_one(char** argv) {
   if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
     goto havoc_stage;
 
-  doing_det = 1;
+  if(energy < calculate_power(len))
+    goto havoc_stage;
 
+  doing_det = 1;
   /*********************************************
    * SIMPLE BITFLIP (+dictionary construction) *
    *********************************************/
@@ -5116,6 +5370,8 @@ static u8 fuzz_one(char** argv) {
 
     FLIP_BIT(out_buf, stage_cur);
 
+    energy_in_det++;
+
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
     FLIP_BIT(out_buf, stage_cur);
@@ -5134,7 +5390,7 @@ static u8 fuzz_one(char** argv) {
 
        We do this here, rather than as a separate stage, because it's a nice
        way to keep the operation approximately "free" (i.e., no extra execs).
-       
+
        Empirically, performing the check when flipping the least significant bit
        is advantageous, compared to doing it at the time of more disruptive
        changes, where the program flow may be affected in more violent ways.
@@ -5180,7 +5436,7 @@ static u8 fuzz_one(char** argv) {
 
       if (cksum != queue_cur->exec_cksum) {
 
-        if (a_len < MAX_AUTO_EXTRA) a_collect[a_len] = out_buf[stage_cur >> 3];        
+        if (a_len < MAX_AUTO_EXTRA) a_collect[a_len] = out_buf[stage_cur >> 3];
         a_len++;
 
       }
@@ -5208,6 +5464,8 @@ static u8 fuzz_one(char** argv) {
 
     FLIP_BIT(out_buf, stage_cur);
     FLIP_BIT(out_buf, stage_cur + 1);
+
+    energy_in_det++;
 
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
@@ -5237,6 +5495,8 @@ static u8 fuzz_one(char** argv) {
     FLIP_BIT(out_buf, stage_cur + 1);
     FLIP_BIT(out_buf, stage_cur + 2);
     FLIP_BIT(out_buf, stage_cur + 3);
+
+    energy_in_det++;
 
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
@@ -5289,6 +5549,8 @@ static u8 fuzz_one(char** argv) {
     stage_cur_byte = stage_cur;
 
     out_buf[stage_cur] ^= 0xFF;
+
+    energy_in_det++;
 
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
@@ -5368,6 +5630,8 @@ static u8 fuzz_one(char** argv) {
 
     *(u16*)(out_buf + i) ^= 0xFFFF;
 
+    energy_in_det++;
+
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     stage_cur++;
 
@@ -5404,6 +5668,8 @@ static u8 fuzz_one(char** argv) {
     stage_cur_byte = i;
 
     *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
+
+    energy_in_det++;
 
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     stage_cur++;
@@ -5461,6 +5727,8 @@ skip_bitflip:
         stage_cur_val = j;
         out_buf[i] = orig + j;
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -5472,6 +5740,8 @@ skip_bitflip:
 
         stage_cur_val = -j;
         out_buf[i] = orig - j;
+
+        energy_in_det++;
 
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
@@ -5521,26 +5791,30 @@ skip_bitflip:
           r4 = orig ^ SWAP16(SWAP16(orig) - j);
 
       /* Try little endian addition and subtraction first. Do it only
-         if the operation would affect more than one byte (hence the 
+         if the operation would affect more than one byte (hence the
          & 0xff overflow checks) and if it couldn't be a product of
          a bitflip. */
 
-      stage_val_type = STAGE_VAL_LE; 
+      stage_val_type = STAGE_VAL_LE;
 
       if ((orig & 0xff) + j > 0xff && !could_be_bitflip(r1)) {
 
         stage_cur_val = j;
         *(u16*)(out_buf + i) = orig + j;
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
- 
+
       } else stage_max--;
 
       if ((orig & 0xff) < j && !could_be_bitflip(r2)) {
 
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = orig - j;
+
+        energy_in_det++;
 
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
@@ -5557,6 +5831,8 @@ skip_bitflip:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) + j);
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -5566,6 +5842,8 @@ skip_bitflip:
 
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) - j);
+
+        energy_in_det++;
 
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
@@ -5625,6 +5903,8 @@ skip_bitflip:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = orig + j;
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -5634,6 +5914,8 @@ skip_bitflip:
 
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = orig - j;
+
+        energy_in_det++;
 
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
@@ -5649,6 +5931,8 @@ skip_bitflip:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) + j);
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -5658,6 +5942,8 @@ skip_bitflip:
 
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) - j);
+
+        energy_in_det++;
 
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
@@ -5718,6 +6004,8 @@ skip_arith:
       stage_cur_val = interesting_8[j];
       out_buf[i] = interesting_8[j];
 
+      energy_in_det++;
+
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
       out_buf[i] = orig;
@@ -5771,6 +6059,8 @@ skip_arith:
 
         *(u16*)(out_buf + i) = interesting_16[j];
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -5784,6 +6074,8 @@ skip_arith:
         stage_val_type = STAGE_VAL_BE;
 
         *(u16*)(out_buf + i) = SWAP16(interesting_16[j]);
+
+        energy_in_det++;
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -5840,6 +6132,8 @@ skip_arith:
 
         *(u32*)(out_buf + i) = interesting_32[j];
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -5853,6 +6147,8 @@ skip_arith:
         stage_val_type = STAGE_VAL_BE;
 
         *(u32*)(out_buf + i) = SWAP32(interesting_32[j]);
+
+        energy_in_det++;
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -5919,6 +6215,8 @@ skip_interest:
       last_len = extras[j].len;
       memcpy(out_buf + i, extras[j].data, last_len);
 
+      energy_in_det++;
+
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
       stage_cur++;
@@ -5953,7 +6251,7 @@ skip_interest:
     for (j = 0; j < extras_cnt; j++) {
 
       if (len + extras[j].len > MAX_FILE) {
-        stage_max--; 
+        stage_max--;
         continue;
       }
 
@@ -5962,6 +6260,8 @@ skip_interest:
 
       /* Copy tail */
       memcpy(ex_tmp + i + extras[j].len, out_buf + i, len - i);
+
+      energy_in_det++;
 
       if (common_fuzz_stuff(argv, ex_tmp, len + extras[j].len)) {
         ck_free(ex_tmp);
@@ -6019,6 +6319,8 @@ skip_user_extras:
       last_len = a_extras[j].len;
       memcpy(out_buf + i, a_extras[j].data, last_len);
 
+      energy_in_det++;
+
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
       stage_cur++;
@@ -6074,7 +6376,16 @@ havoc_stage:
 
   }
 
-  if (stage_max < HAVOC_MIN) stage_max = HAVOC_MIN;
+  stage_max = energy - energy_in_det;
+
+  if (stage_max < HAVOC_MIN) {
+    stage_max = HAVOC_MIN;
+  }
+
+  s32 temp_stage = stage_max;
+  u32 temp_score = perf_score;
+
+  write_to_information_file("start");
 
   temp_len = len;
 
@@ -6090,7 +6401,7 @@ havoc_stage:
     u32 use_stacking = 1 << (1 + UR(HAVOC_STACK_POW2));
 
     stage_cur_val = use_stacking;
- 
+
     for (i = 0; i < use_stacking; i++) {
 
       switch (UR(15 + ((extras_cnt + a_extras_cnt) ? 2 : 0))) {
@@ -6102,7 +6413,7 @@ havoc_stage:
           FLIP_BIT(out_buf, UR(temp_len << 3));
           break;
 
-        case 1: 
+        case 1:
 
           /* Set byte to interesting value. */
 
@@ -6136,7 +6447,7 @@ havoc_stage:
           if (temp_len < 4) break;
 
           if (UR(2)) {
-  
+
             *(u32*)(out_buf + UR(temp_len - 3)) =
               interesting_32[UR(sizeof(interesting_32) >> 2)];
 
@@ -6464,8 +6775,8 @@ havoc_stage:
       }
 
     }
-
-    if (common_fuzz_stuff(argv, out_buf, temp_len))
+    ret_of_fuzz = common_fuzz_stuff(argv, out_buf, temp_len);
+    if (ret_of_fuzz)
       goto abandon_entry;
 
     /* out_buf might have been mangled a bit, so let's restore it to its
@@ -6479,19 +6790,25 @@ havoc_stage:
        permitting. */
 
     if (queued_paths != havoc_queued) {
-
+/*
       if (perf_score <= HAVOC_MAX_MULT * 100) {
-        stage_max  *= 2;
-        perf_score *= 2;
+        stage_max += temp_stage;
+        perf_score += temp_score;
       }
-
+*/
+      record_num = stage_cur + 1;
       havoc_queued = queued_paths;
+      regret = (float)record_num / stage_max;
 
     }
 
   }
 
+exit_havoc:
+
   new_hit_cnt = queued_paths + unique_crashes;
+
+  write_to_information_file("end");
 
   if (!splice_cycle) {
     stage_finds[STAGE_HAVOC]  += new_hit_cnt - orig_hit_cnt;
@@ -6513,7 +6830,7 @@ havoc_stage:
      code to mutate that blob. */
 
 retry_splicing:
-
+  use_splicing = 0;
   if (use_splicing && splice_cycle++ < SPLICE_CYCLES &&
       queued_paths > 1 && queue_cur->len > 1) {
 
@@ -6587,6 +6904,8 @@ retry_splicing:
     out_buf = ck_alloc_nozero(len);
     memcpy(out_buf, in_buf, len);
 
+    queue_cur->chose_time++;
+
     goto havoc_stage;
 
   }
@@ -6602,6 +6921,10 @@ abandon_entry:
   /* Update pending_not_fuzzed count if we made it through the calibration
      cycle and have not seen this entry before. */
 
+  if(!queue_cur->was_fuzzed){
+    queue_cur->line = queued_paths;
+  }
+
   if (!stop_soon && !queue_cur->cal_failed && !queue_cur->was_fuzzed) {
     queue_cur->was_fuzzed = 1;
     pending_not_fuzzed--;
@@ -6613,6 +6936,28 @@ abandon_entry:
   if (in_buf != orig_in) ck_free(in_buf);
   ck_free(out_buf);
   ck_free(eff_map);
+
+  queue_cur->TS_max = 0;
+  queue_cur->last_found = queued_paths - last_queued_paths;
+  queue_cur->last_energy = queue_cur->mutation_num - last_mutation_num;
+  if(regret == 0)
+    regret = 1.1;
+
+  rate = ((rate * calculate_coe) + regret)/(calculate_coe + 1);
+
+  calculate_coe++;
+  if ( calculate_coe > queued_paths / 100)
+    calculate_coe = queued_paths / 100;
+
+  if ( rate > 1.5 )
+    rate = 1.5;
+  else if(rate < 0.1)
+    rate = 0.1;
+
+  end_record = get_cur_time_us();
+  record_time = end_record - start_record;
+
+  write_to_time_file(record_time);
 
   return ret_val;
 
@@ -6669,12 +7014,12 @@ static void sync_fuzzers(char** argv) {
 
     if (id_fd < 0) PFATAL("Unable to create '%s'", qd_synced_path);
 
-    if (read(id_fd, &min_accept, sizeof(u32)) > 0) 
+    if (read(id_fd, &min_accept, sizeof(u32)) > 0)
       lseek(id_fd, 0, SEEK_SET);
 
     next_min_accept = min_accept;
 
-    /* Show stats */    
+    /* Show stats */
 
     sprintf(stage_tmp, "sync %u", ++sync_cnt);
     stage_name = stage_tmp;
@@ -6691,7 +7036,7 @@ static void sync_fuzzers(char** argv) {
       struct stat st;
 
       if (qd_ent->d_name[0] == '.' ||
-          sscanf(qd_ent->d_name, CASE_PREFIX "%06u", &syncing_case) != 1 || 
+          sscanf(qd_ent->d_name, CASE_PREFIX "%06u", &syncing_case) != 1 ||
           syncing_case < min_accept) continue;
 
       /* OK, sounds like a new one. Let's give it a try. */
@@ -6751,8 +7096,8 @@ static void sync_fuzzers(char** argv) {
     closedir(qd);
     ck_free(qd_path);
     ck_free(qd_synced_path);
-    
-  }  
+
+  }
 
   closedir(sd);
 
@@ -6763,7 +7108,7 @@ static void sync_fuzzers(char** argv) {
 
 static void handle_stop_sig(int sig) {
 
-  stop_soon = 1; 
+  stop_soon = 1;
 
   if (child_pid > 0) kill(child_pid, SIGKILL);
   if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
@@ -6785,12 +7130,12 @@ static void handle_timeout(int sig) {
 
   if (child_pid > 0) {
 
-    child_timed_out = 1; 
+    child_timed_out = 1;
     kill(child_pid, SIGKILL);
 
   } else if (child_pid == -1 && forksrv_pid > 0) {
 
-    child_timed_out = 1; 
+    child_timed_out = 1;
     kill(forksrv_pid, SIGKILL);
 
   }
@@ -6880,8 +7225,8 @@ EXP_ST void check_binary(u8* fname) {
          "    sometimes generate shell stubs for dynamically linked programs; try static\n"
          "    library mode (./configure --disable-shared) if that's the case.\n\n"
 
-         "    Another possible cause is that you are actually trying to use a shell\n" 
-         "    wrapper around the fuzzed component. Invoking shell can slow down the\n" 
+         "    Another possible cause is that you are actually trying to use a shell\n"
+         "    wrapper around the fuzzed component. Invoking shell can slow down the\n"
          "    fuzzing process by a factor of 20x or more; it's best to write the wrapper\n"
          "    in a compiled language instead.\n");
 
@@ -7054,8 +7399,8 @@ static void usage(u8* argv0) {
        "  -f file       - location read by the fuzzed program (stdin)\n"
        "  -t msec       - timeout for each run (auto-scaled, 50-%u ms)\n"
        "  -m megs       - memory limit for child process (%u MB)\n"
-       "  -Q            - use binary-only instrumentation (QEMU mode)\n\n"     
- 
+       "  -Q            - use binary-only instrumentation (QEMU mode)\n\n"
+
        "Fuzzing behavior settings:\n\n"
 
        "  -d            - quick & dirty mode (skips deterministic steps)\n"
@@ -7194,7 +7539,7 @@ EXP_ST void setup_dirs_fds(void) {
 
   fprintf(plot_file, "# unix_time, cycles_done, cur_path, paths_total, "
                      "pending_total, pending_favs, map_size, unique_crashes, "
-                     "unique_hangs, max_depth, execs_per_sec\n");
+                     "unique_hangs, max_depth, execs_per_sec, total_execs, state\n");
                      /* ignore errors */
 
 }
@@ -7223,12 +7568,12 @@ static void check_crash_handling(void) {
 
 #ifdef __APPLE__
 
-  /* Yuck! There appears to be no simple C API to query for the state of 
+  /* Yuck! There appears to be no simple C API to query for the state of
      loaded daemons on MacOS X, and I'm a bit hesitant to do something
      more sophisticated, such as disabling crash reporting via Mach ports,
      until I get a box to test the code. So, for now, we check for crash
      reporting the awful way. */
-  
+
   if (system("launchctl list 2>/dev/null | grep -q '\\.ReportCrash$'")) return;
 
   SAYF("\n" cLRD "[-] " cRST
@@ -7236,7 +7581,7 @@ static void check_crash_handling(void) {
        "    external crash reporting utility. This will cause issues due to the\n"
        "    extended delay between the fuzzed binary malfunctioning and this fact\n"
        "    being relayed to the fuzzer via the standard waitpid() API.\n\n"
-       "    To avoid having crashes misinterpreted as timeouts, please run the\n" 
+       "    To avoid having crashes misinterpreted as timeouts, please run the\n"
        "    following commands:\n\n"
 
        "    SL=/System/Library; PL=com.apple.ReportCrash\n"
@@ -7266,7 +7611,7 @@ static void check_crash_handling(void) {
          "    between stumbling upon a crash and having this information relayed to the\n"
          "    fuzzer via the standard waitpid() API.\n\n"
 
-         "    To avoid having crashes misinterpreted as timeouts, please log in as root\n" 
+         "    To avoid having crashes misinterpreted as timeouts, please log in as root\n"
          "    and temporarily modify /proc/sys/kernel/core_pattern, like so:\n\n"
 
          "    echo core >/proc/sys/kernel/core_pattern\n");
@@ -7275,7 +7620,7 @@ static void check_crash_handling(void) {
       FATAL("Pipe at the beginning of 'core_pattern'");
 
   }
- 
+
   close(fd);
 
 #endif /* ^__APPLE__ */
@@ -7411,7 +7756,7 @@ static void get_core_count(void) {
       } else if (cur_runnable + 1 <= cpu_core_count) {
 
         OKF("Try parallel jobs - see %s/parallel_fuzzing.txt.", doc_path);
-  
+
       }
 
     }
@@ -7503,7 +7848,7 @@ static void check_asan_opts(void) {
 
   }
 
-} 
+}
 
 
 /* Detect @@ in args. */
@@ -7680,7 +8025,7 @@ static void save_cmdline(u32 argc, char** argv) {
 
   for (i = 0; i < argc; i++)
     len += strlen(argv[i]) + 1;
-  
+
   buf = orig_cmdline = ck_alloc(len);
 
   for (i = 0; i < argc; i++) {
@@ -7765,7 +8110,7 @@ int main(int argc, char** argv) {
 
         break;
 
-      case 'S': 
+      case 'S':
 
         if (sync_id) FATAL("Multiple -S or -M options not supported");
         sync_id = ck_strdup(optarg);
@@ -7956,6 +8301,8 @@ int main(int argc, char** argv) {
   init_count_class16();
 
   setup_dirs_fds();
+  setup_information_fds();
+  setup_time_fds();
   read_testcases();
   load_auto();
 
@@ -7999,6 +8346,8 @@ int main(int argc, char** argv) {
     if (stop_soon) goto stop_fuzzing;
   }
 
+  queued_paths_initial = queued_paths;
+
   while (1) {
 
     u8 skipped_fuzz;
@@ -8008,6 +8357,7 @@ int main(int argc, char** argv) {
     if (!queue_cur) {
 
       queue_cycle++;
+
       current_entry     = 0;
       cur_skipped_paths = 0;
       queue_cur         = queue;
@@ -8041,10 +8391,12 @@ int main(int argc, char** argv) {
 
     }
 
+    schedule();
+
     skipped_fuzz = fuzz_one(use_argv);
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
-      
+
       if (!(sync_interval_cnt++ % SYNC_INTERVAL))
         sync_fuzzers(use_argv);
 
