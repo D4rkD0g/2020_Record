@@ -2264,9 +2264,7 @@
   },
         "input": [
           "module_apply_default/MobilenetV1/MobilenetV1/Conv2d_5_pointwise/Relu6",
-            "__proto__": {
-    "LambdaX": "I'm Here!"
-  },
+
           "module_apply_default/MobilenetV1/MobilenetV1/Conv2d_6_depthwise/depthwise_weights",
           "module_apply_default/MobilenetV1/MobilenetV1/Conv2d_6_depthwise/depthwise_bn_offset"
         ],
