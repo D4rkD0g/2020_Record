@@ -111,6 +111,9 @@
       },
       {
         "name": "module_apply_default/hub_input/Mul/y",
+          "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
         "op": "Const",
         "attr": {
           "value": {
@@ -130,6 +133,9 @@
         "attr": {
           "value": {
             "tensor": {
+            	  "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
               "dtype": "DT_FLOAT",
               "tensorShape": {}
             }
@@ -2253,8 +2259,14 @@
       {
         "name": "module_apply_default/MobilenetV1/MobilenetV1/Conv2d_6_depthwise/depthwise",
         "op": "FusedDepthwiseConv2dNative",
+          "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
         "input": [
           "module_apply_default/MobilenetV1/MobilenetV1/Conv2d_5_pointwise/Relu6",
+            "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
           "module_apply_default/MobilenetV1/MobilenetV1/Conv2d_6_depthwise/depthwise_weights",
           "module_apply_default/MobilenetV1/MobilenetV1/Conv2d_6_depthwise/depthwise_bn_offset"
         ],
