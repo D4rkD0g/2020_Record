@@ -10,11 +10,23 @@
       "LambdaX": "I'm Here!"
     },
     "signature": {
+    	  "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
       "inputs": {
+      	  "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
         "images:0": {
+        	  "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
           "name": "images:0",
           "dtype": "DT_FLOAT",
           "tensorShape": {
+          	  "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
             "dim": [
               {
                 "size": "-1"
@@ -33,16 +45,22 @@
         }
       },
       "outputs": {
+      	  "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
         "module_apply_default/MobilenetV1/Logits/SpatialSqueeze:0": {
           "name": "module_apply_default/MobilenetV1/Logits/SpatialSqueeze:0",
-          "__proto__": {
-            "oops": "It works !"
-          },
+  "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
           "dtype": "DT_FLOAT",
           "tensorShape": {
             "dim": [
               {
-                "size": "-1"
+                "size": "-1", 
+                 "__proto__": {
+    "LambdaX": "I'm Here!"
+  }
               },
               {
                 "size": "1001"
@@ -58,8 +76,17 @@
       {
         "name": "images",
         "op": "Placeholder",
+          "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
         "attr": {
+        	  "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
           "shape": {
+          	  "__proto__": {
+    "LambdaX": "I'm Here!"
+  },
             "shape": {
               "dim": [
                 {
